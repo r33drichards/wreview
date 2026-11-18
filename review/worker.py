@@ -97,7 +97,8 @@ class Worker:
             try:
                 self.review(delivery, json.loads(payload))
             except Exception as error:
-                print(f"Review delivery {delivery} failed: {type(error).__name__}", flush=True)
+                detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+                print(f"Review delivery {delivery} failed: {detail}", flush=True)
                 with closing(self.connect()) as db, db:
                     db.execute("UPDATE inbox SET done = 1 WHERE id = ?", (delivery,))
                 continue
