@@ -211,20 +211,11 @@ explicit and are not silently run on HTTP startup.
 
 ## Review a GitHub pull request
 
-In the GitHub repository, add `CHATGPT_ACCESS_TOKEN` as an Actions secret and
-`OPENAI_MODEL` as an Actions variable. Use an access token issued by the
-runner's Sign in with ChatGPT flow and a model listed for that account. Rotate
-the token when it expires. GitHub Actions supplies the PR-scoped write
-credential for the review job.
+Add the `wreview` label to an open pull request. The webhook worker posts a
+starting comment, fetches the PR's changed files through the GitHub API,
+and prepares an isolated mcp-js snapshot. Wasmer runs the review turn.
+The worker validates changed-line anchors and checks the current head before
+publishing a comment-only review, then updates the status comment. Remove
+and reapply the label to request a new review.
 
-Create the `wreview` repository label and add it to an open PR after the
-workflow is on its base branch. The workflow uses GitHub's
-`pull_request_target:labeled` event and checks out the trusted base commit.
-It reads changed files through the GitHub API, prepares an isolated mcp-js
-snapshot, runs one WASM turn, and publishes a comment-only review. The
-review body provides general feedback and inline comments target changed
-lines. PR branches, including forks, are read as data.
-
-The Actions run reports the review ID or why publication was skipped. A
-rerun reconciles an existing review from the same run. Remove and reapply
-`wreview` to request a new review at the current commit.
+See [hosted review setup](review/README.md) for deployment and credentials.
