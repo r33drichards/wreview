@@ -5,6 +5,7 @@ import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 import secrets
@@ -13,7 +14,7 @@ from threading import Event, Thread
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from run import API, PROMPT, TOOLS, NoRedirect, ReviewTools, js, pages, request
+from run import API, MCP_JS, PROMPT, TOOLS, NoRedirect, ReviewTools, js, pages, request
 
 
 class Worker:
@@ -156,6 +157,21 @@ class Worker:
             github(status_url, {"body": f"wreview failed.\n\n{status_marker}"}, method="PATCH")
             raise
         github(status_url, {"body": f"{message}\n\n{status_marker}"}, method="PATCH")
+        if posted is not None and current():
+            with closing(self.connect()) as db:
+                newer = db.execute(
+                    "SELECT 1 FROM inbox WHERE done = 0 AND rowid > "
+                    "(SELECT rowid FROM inbox WHERE id = ?) "
+                    "AND json_extract(payload, '$.repo') = ? "
+                    "AND json_extract(payload, '$.number') = ? LIMIT 1",
+                    (delivery, repo, number),
+                ).fetchone()
+            if newer is None:
+                try:
+                    github(f"{root}/issues/{number}/labels/wreview", method="DELETE")
+                except RuntimeError:
+                    if current():
+                        raise
 
     def run_review(self, delivery, repo, pr, files, current, pull, marker):
         context = {"repo": repo, "number": pr["number"], "base_sha": pr["base"],
@@ -248,7 +264,9 @@ class Worker:
 
 
 def serve():
-    worker = Worker()
+    relay_only = os.environ.get("REVIEW_MCP_RELAY_ONLY") == "true"
+    worker = None if relay_only else Worker()
+    relay_token = os.environ.get("REVIEW_MCP_TOKEN", "")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -262,11 +280,24 @@ def serve():
             if value is not None:
                 self.wfile.write(json.dumps(value).encode())
 
+        def relay(self, path, payload=None):
+            authorization = self.headers.get_all("Authorization", [])
+            if (not relay_token or len(authorization) != 1
+                    or not secrets.compare_digest(authorization[0].encode(), f"Bearer {relay_token}".encode())):
+                return self.reply(401)
+            try:
+                return self.reply(200, request(f"{MCP_JS}{path}", payload))
+            except (RuntimeError, OSError):
+                return self.reply(502)
+
         def do_GET(self):
-            self.reply(200 if self.path == "/health" else 404)
+            prefix = "/review-mcp"
+            if re.fullmatch(r"/review-mcp/api/executions/[A-Za-z0-9_-]+(?:/output\?byte_limit=100000)?", self.path):
+                return self.relay(self.path.removeprefix(prefix))
+            return self.reply(200 if self.path == "/health" else 404)
 
         def do_POST(self):
-            if self.path != "/github/webhook":
+            if self.path != "/review-mcp/api/exec" and (worker is None or self.path != "/github/webhook"):
                 return self.reply(404)
             try:
                 length = int(self.headers["Content-Length"])
@@ -274,13 +305,19 @@ def serve():
                     return self.reply(413)
                 self.connection.settimeout(5)
                 body = self.rfile.read(length)
+                if self.path == "/review-mcp/api/exec":
+                    payload = json.loads(body)
+                    if not isinstance(payload, dict):
+                        return self.reply(400)
+                    return self.relay("/api/exec", payload)
                 return self.reply(worker.accept(self.headers, body))
             except (TypeError, ValueError):
                 return self.reply(400)
             except (OSError, sqlite3.Error):
                 return self.reply(503)
 
-    Thread(target=worker.serve_queue, daemon=True).start()
+    if worker is not None:
+        Thread(target=worker.serve_queue, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), Handler).serve_forever()
 
 
