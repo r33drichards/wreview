@@ -1,6 +1,5 @@
 use crate::{config, model};
 use anyhow::{Context, Result, ensure};
-use minimal_mcp_agent::agent;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -12,17 +11,13 @@ use std::{
     },
     time::Duration,
 };
-use tiny_http::{Method, Request, Response, Server, StatusCode};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Turn {
-    capability: String,
-    input: String,
-    instructions: String,
+struct ModelStep {
+    messages: Vec<Value>,
     tools: Vec<Value>,
-    #[serde(default)]
-    async_completion: bool,
 }
 
 fn header(request: &Request, name: &'static str) -> Option<String> {
@@ -38,12 +33,8 @@ fn body(request: &mut Request, max: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn run_turn(turn: Turn, worker: &str, model_name: &str) -> Result<()> {
-    ensure!(
-        turn.capability.len() == 64 && turn.capability.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "Invalid review capability"
-    );
-    let tools: Vec<_> = turn
+fn run_step(step: ModelStep, model_name: &str) -> Result<Vec<Value>> {
+    let tools: Vec<_> = step
         .tools
         .iter()
         .map(|tool| {
@@ -53,25 +44,11 @@ fn run_turn(turn: Turn, worker: &str, model_name: &str) -> Result<()> {
             })
         })
         .collect();
-    let token = config::chatgpt_token()?;
-    let client = model::client()?;
-    let mut messages = vec![json!({"role": "developer", "content": turn.instructions})];
-    agent::run_turn(
-        &mut messages,
-        &turn.input,
-        20,
-        |messages| model::prompt(&token, model_name, messages, &tools),
-        |name, arguments| {
-            let arguments: Value = serde_json::from_str(arguments)?;
-            Ok(client
-                .post(format!("{worker}/tool"))
-                .bearer_auth(&turn.capability)
-                .json(&json!({"name": name, "arguments": arguments}))
-                .send()?
-                .error_for_status()?
-                .json()?)
-        },
-        |_| {},
+    model::prompt(
+        &config::chatgpt_token()?,
+        model_name,
+        &step.messages,
+        &tools,
     )
 }
 
@@ -125,7 +102,7 @@ pub fn serve() -> Result<()> {
                 }
                 _ => 400,
             },
-            (&Method::Post, "/turn") => {
+            (&Method::Post, "/model-step") => {
                 if !header(&request, "Authorization")
                     .is_some_and(|value| crate::server::authorized(&value, &token))
                 {
@@ -134,51 +111,26 @@ pub fn serve() -> Result<()> {
                     409
                 } else {
                     let busy = Arc::clone(&busy);
-                    let worker = worker.clone();
                     let model_name = model_name.clone();
                     std::thread::spawn(move || {
-                        let Ok(turn) = body(&mut request, 1024 * 1024)
-                            .and_then(|bytes| Ok(serde_json::from_slice::<Turn>(&bytes)?))
-                        else {
-                            busy.store(false, Ordering::Release);
-                            let _ = request.respond(Response::empty(StatusCode(400)));
-                            return;
-                        };
-                        let capability = turn.capability.clone();
-                        let pending = if turn.async_completion {
-                            if request.respond(Response::empty(StatusCode(202))).is_err() {
-                                busy.store(false, Ordering::Release);
-                                return;
-                            }
-                            None
-                        } else {
-                            Some(request)
-                        };
-                        let status = match run_turn(turn, &worker, &model_name) {
-                            Ok(()) => 200,
-                            Err(error) => {
-                                eprintln!("Review turn failed: {error}");
-                                502
-                            }
+                        let response = match body(&mut request, 1024 * 1024)
+                            .and_then(|bytes| Ok(serde_json::from_slice::<ModelStep>(&bytes)?))
+                        {
+                            Ok(step) => match run_step(step, &model_name) {
+                                Ok(output) => Response::from_string(json!(output).to_string())
+                                    .with_header(
+                                        Header::from_bytes("Content-Type", "application/json")
+                                            .unwrap(),
+                                    ),
+                                Err(error) => {
+                                    eprintln!("Review model step failed: {error}");
+                                    Response::from_string("").with_status_code(502)
+                                }
+                            },
+                            Err(_) => Response::from_string("").with_status_code(400),
                         };
                         busy.store(false, Ordering::Release);
-                        if let Some(request) = pending {
-                            let _ = request.respond(Response::empty(StatusCode(status)));
-                        } else {
-                            let result = model::client().and_then(|client| {
-                                client
-                                    .post(format!("{worker}/complete"))
-                                    .bearer_auth(capability)
-                                    .timeout(Duration::from_secs(5))
-                                    .json(&json!({"success": status == 200}))
-                                    .send()?
-                                    .error_for_status()?;
-                                Ok(())
-                            });
-                            if let Err(error) = result {
-                                eprintln!("Review completion callback failed: {error}");
-                            }
-                        }
+                        let _ = request.respond(response);
                     });
                     continue;
                 }

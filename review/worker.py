@@ -7,7 +7,7 @@ import json
 import os
 import secrets
 import sqlite3
-from threading import Event, Lock, Thread
+from threading import Event, Thread
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -33,8 +33,6 @@ class Worker:
             raise ValueError("WASMER_REVIEW_URL must be an HTTPS URL")
         self.db = os.environ["REVIEW_DB"]
         self.wake = Event()
-        self.lock = Lock()
-        self.active = None
         self.actor = request(f"{API}/user", token=self.token)["login"]
         with closing(self.connect()) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS inbox "
@@ -168,23 +166,7 @@ class Worker:
         tools = ReviewTools(session, seed["heap"], files)
         if not tools.heap:
             raise RuntimeError("mcp-js did not save the prepared state")
-        capability = secrets.token_hex(32)
-        with self.lock:
-            self.active = (capability, tools, Event(), [])
-        try:
-            request(f"{self.runner}/turn", {
-                "capability": capability, "instructions": PROMPT.read_text(),
-                "input": f"Review {repo} pull request #{pr['number']} at {pr['head']}.",
-                "tools": TOOLS, "async_completion": True,
-            }, token=self.runner_token, timeout=15)
-            _, _, completed, result = self.active
-            if not completed.wait(300):
-                raise RuntimeError("Wasmer did not send a completion callback")
-            if not result[0]:
-                raise RuntimeError("Wasmer reported a failed review turn")
-        finally:
-            with self.lock:
-                self.active = None
+        self.run_model(tools, repo, pr)
         if tools.review is None:
             raise RuntimeError("Agent completed without staging a review")
         if not current():
@@ -195,34 +177,42 @@ class Worker:
             **review, "event": "COMMENT", "commit_id": pr["head"],
         }, token=self.token)
 
-    def complete(self, authorization, value):
-        with self.lock:
-            if not self.authorized(authorization):
-                return 401, {}
-            if type(value.get("success")) is not bool:
-                return 400, {}
-            _, _, completed, result = self.active
-            if not completed.is_set():
-                result.append(value["success"])
-                completed.set()
-            return 200, {}
-
-    def authorized(self, authorization):
-        return self.active is not None and secrets.compare_digest(
-            authorization.encode(), f"Bearer {self.active[0]}".encode()
-        )
-
-    def tool(self, authorization, value):
-        with self.lock:
-            if not self.authorized(authorization) or self.active[2].is_set():
-                return 401, {}
-            try:
-                args = value.get("arguments", {})
-                if not isinstance(args, dict):
-                    raise ValueError("Tool arguments must be an object")
-                return 200, {"result": self.active[1].call(value["name"], args)}
-            except (KeyError, ValueError) as error:
-                return 200, {"isError": True, "error": str(error)}
+    def run_model(self, tools, repo, pr):
+        messages = [
+            {"role": "developer", "content": PROMPT.read_text()},
+            {"role": "user", "content": f"Review {repo} pull request #{pr['number']} at {pr['head']}."},
+        ]
+        ids = set()
+        for _ in range(20):
+            output = request(f"{self.runner}/model-step", {
+                "messages": messages, "tools": TOOLS,
+            }, token=self.runner_token, timeout=60)
+            calls = []
+            for item in output:
+                if item["type"] != "function_call":
+                    continue
+                call_id = item["call_id"]
+                if not call_id or call_id in ids:
+                    raise RuntimeError("Duplicate or empty model tool call ID")
+                ids.add(call_id)
+                calls.append((call_id, item["name"], item["arguments"]))
+            if not calls:
+                return
+            messages.extend(output)
+            for call_id, name, arguments in calls:
+                try:
+                    args = json.loads(arguments)
+                    if not isinstance(args, dict):
+                        raise ValueError("Tool arguments must be an object")
+                    result = {"result": tools.call(name, args)}
+                except (KeyError, ValueError) as error:
+                    result = {"isError": True, "error": str(error)}
+                messages.append({
+                    "type": "function_call_output", "call_id": call_id, "output": json.dumps(result),
+                })
+            if tools.review is not None:
+                return
+        raise RuntimeError("Review reached the model step limit")
 
 
 def serve():
@@ -244,7 +234,7 @@ def serve():
             self.reply(200 if self.path == "/health" else 404)
 
         def do_POST(self):
-            if self.path not in {"/github/webhook", "/tool", "/complete"}:
+            if self.path != "/github/webhook":
                 return self.reply(404)
             try:
                 length = int(self.headers["Content-Length"])
@@ -252,13 +242,7 @@ def serve():
                     return self.reply(413)
                 self.connection.settimeout(5)
                 body = self.rfile.read(length)
-                if self.path == "/github/webhook":
-                    return self.reply(worker.accept(self.headers, body))
-                payload = json.loads(body)
-                if not isinstance(payload, dict):
-                    return self.reply(400)
-                handler = worker.complete if self.path == "/complete" else worker.tool
-                return self.reply(*handler(self.headers.get("Authorization", ""), payload))
+                return self.reply(worker.accept(self.headers, body))
             except (TypeError, ValueError):
                 return self.reply(400)
             except (OSError, sqlite3.Error):
