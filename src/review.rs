@@ -21,6 +21,8 @@ struct Turn {
     input: String,
     instructions: String,
     tools: Vec<Value>,
+    #[serde(default)]
+    async_completion: bool,
 }
 
 fn header(request: &Request, name: &'static str) -> Option<String> {
@@ -135,20 +137,48 @@ pub fn serve() -> Result<()> {
                     let worker = worker.clone();
                     let model_name = model_name.clone();
                     std::thread::spawn(move || {
-                        let status = match body(&mut request, 1024 * 1024)
-                            .and_then(|bytes| Ok(serde_json::from_slice(&bytes)?))
-                        {
-                            Ok(turn) => match run_turn(turn, &worker, &model_name) {
-                                Ok(()) => 200,
-                                Err(error) => {
-                                    eprintln!("Review turn failed: {error}");
-                                    502
-                                }
-                            },
-                            Err(_) => 400,
+                        let Ok(turn) = body(&mut request, 1024 * 1024)
+                            .and_then(|bytes| Ok(serde_json::from_slice::<Turn>(&bytes)?))
+                        else {
+                            busy.store(false, Ordering::Release);
+                            let _ = request.respond(Response::empty(StatusCode(400)));
+                            return;
+                        };
+                        let capability = turn.capability.clone();
+                        let pending = if turn.async_completion {
+                            if request.respond(Response::empty(StatusCode(202))).is_err() {
+                                busy.store(false, Ordering::Release);
+                                return;
+                            }
+                            None
+                        } else {
+                            Some(request)
+                        };
+                        let status = match run_turn(turn, &worker, &model_name) {
+                            Ok(()) => 200,
+                            Err(error) => {
+                                eprintln!("Review turn failed: {error}");
+                                502
+                            }
                         };
                         busy.store(false, Ordering::Release);
-                        let _ = request.respond(Response::empty(StatusCode(status)));
+                        if let Some(request) = pending {
+                            let _ = request.respond(Response::empty(StatusCode(status)));
+                        } else {
+                            let result = model::client().and_then(|client| {
+                                client
+                                    .post(format!("{worker}/complete"))
+                                    .bearer_auth(capability)
+                                    .timeout(Duration::from_secs(5))
+                                    .json(&json!({"success": status == 200}))
+                                    .send()?
+                                    .error_for_status()?;
+                                Ok(())
+                            });
+                            if let Err(error) = result {
+                                eprintln!("Review completion callback failed: {error}");
+                            }
+                        }
                     });
                     continue;
                 }

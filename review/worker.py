@@ -170,14 +170,18 @@ class Worker:
             raise RuntimeError("mcp-js did not save the prepared state")
         capability = secrets.token_hex(32)
         with self.lock:
-            self.active = (capability, tools)
+            self.active = (capability, tools, Event(), [])
         try:
-            # Wasmer returns an empty body on success.
             request(f"{self.runner}/turn", {
                 "capability": capability, "instructions": PROMPT.read_text(),
                 "input": f"Review {repo} pull request #{pr['number']} at {pr['head']}.",
-                "tools": TOOLS,
-            }, token=self.runner_token, timeout=600)
+                "tools": TOOLS, "async_completion": True,
+            }, token=self.runner_token, timeout=15)
+            _, _, completed, result = self.active
+            if not completed.wait(300):
+                raise RuntimeError("Wasmer did not send a completion callback")
+            if not result[0]:
+                raise RuntimeError("Wasmer reported a failed review turn")
         finally:
             with self.lock:
                 self.active = None
@@ -191,11 +195,26 @@ class Worker:
             **review, "event": "COMMENT", "commit_id": pr["head"],
         }, token=self.token)
 
+    def complete(self, authorization, value):
+        with self.lock:
+            if not self.authorized(authorization):
+                return 401, {}
+            if type(value.get("success")) is not bool:
+                return 400, {}
+            _, _, completed, result = self.active
+            if not completed.is_set():
+                result.append(value["success"])
+                completed.set()
+            return 200, {}
+
+    def authorized(self, authorization):
+        return self.active is not None and secrets.compare_digest(
+            authorization.encode(), f"Bearer {self.active[0]}".encode()
+        )
+
     def tool(self, authorization, value):
         with self.lock:
-            if self.active is None or not secrets.compare_digest(
-                authorization.encode(), f"Bearer {self.active[0]}".encode()
-            ):
+            if not self.authorized(authorization) or self.active[2].is_set():
                 return 401, {}
             try:
                 args = value.get("arguments", {})
@@ -225,7 +244,7 @@ def serve():
             self.reply(200 if self.path == "/health" else 404)
 
         def do_POST(self):
-            if self.path not in {"/github/webhook", "/tool"}:
+            if self.path not in {"/github/webhook", "/tool", "/complete"}:
                 return self.reply(404)
             try:
                 length = int(self.headers["Content-Length"])
@@ -238,7 +257,8 @@ def serve():
                 payload = json.loads(body)
                 if not isinstance(payload, dict):
                     return self.reply(400)
-                return self.reply(*worker.tool(self.headers.get("Authorization", ""), payload))
+                handler = worker.complete if self.path == "/complete" else worker.tool
+                return self.reply(*handler(self.headers.get("Authorization", ""), payload))
             except (TypeError, ValueError):
                 return self.reply(400)
             except (OSError, sqlite3.Error):
