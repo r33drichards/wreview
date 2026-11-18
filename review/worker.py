@@ -23,6 +23,9 @@ class Worker:
         }
         self.token = os.environ["GITHUB_REVIEW_TOKEN"]
         self.secret = os.environ["GITHUB_WEBHOOK_SECRET"].encode()
+        self.app_secret = os.environ.get("GITHUB_APP_WEBHOOK_SECRET", "").encode()
+        self.app_owner = os.environ.get("GITHUB_APP_REPOSITORY_OWNER", "").casefold()
+        self.installation = int(os.environ.get("GITHUB_APP_INSTALLATION_ID", "0"))
         self.runner_token = os.environ["RUNNER_API_TOKEN"]
         self.runner = os.environ["WASMER_REVIEW_URL"].rstrip("/")
         origin = urlsplit(self.runner)
@@ -41,9 +44,17 @@ class Worker:
         return sqlite3.connect(self.db, timeout=3)
 
     def accept(self, headers, raw):
-        signature = "sha256=" + hmac.new(self.secret, raw, sha256).hexdigest()
         values = headers.get_all("X-Hub-Signature-256", [])
-        if len(values) != 1 or not hmac.compare_digest(signature.encode(), values[0].encode()):
+        if len(values) != 1:
+            return 401
+
+        def signed_with(key):
+            return bool(key) and hmac.compare_digest(
+                b"sha256=" + hmac.new(key, raw, sha256).hexdigest().encode(), values[0].encode()
+            )
+
+        app_delivery = signed_with(self.app_secret)
+        if not app_delivery and not signed_with(self.secret):
             return 401
         kind = headers.get("X-GitHub-Event")
         if kind == "ping":
@@ -57,12 +68,15 @@ class Worker:
                 return 204
             pr = event["pull_request"]
             repo = event["repository"]["full_name"]
-            if repo not in self.repos or pr["base"]["repo"]["full_name"] != repo:
+            installation = event.get("installation", {}).get("id") if app_delivery else None
+            if (not self.allows_repository(repo, installation)
+                    or (app_delivery and installation != self.installation)
+                    or pr["base"]["repo"]["full_name"] != repo):
                 return 403
             if type(pr["number"]) is not int or pr["number"] < 1:
                 return 400
             payload = {key: pr[key] for key in ("number", "changed_files")}
-            payload.update(repo=repo, head=pr["head"]["sha"], base=pr["base"]["sha"])
+            payload.update(repo=repo, installation=installation, head=pr["head"]["sha"], base=pr["base"]["sha"])
         except (KeyError, TypeError, ValueError):
             return 400
         with closing(self.connect()) as db, db:
@@ -90,10 +104,18 @@ class Worker:
             with closing(self.connect()) as db, db:
                 db.execute("UPDATE inbox SET done = 1 WHERE id = ?", (delivery,))
 
+    def allows_repository(self, repo, installation):
+        if installation is None:
+            return repo in self.repos
+        owner, separator, name = repo.partition("/")
+        return bool(self.installation and installation == self.installation
+                    and self.app_owner and owner.casefold() == self.app_owner
+                    and separator and name and "/" not in name)
+
     def review(self, delivery, pr):
         number = pr["number"]
         repo = pr.get("repo", self.repo)
-        if repo not in self.repos:
+        if not self.allows_repository(repo, pr.get("installation")):
             return
         root = f"{API}/repos/{repo}"
         pull = f"{root}/pulls/{number}"
