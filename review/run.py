@@ -273,6 +273,12 @@ def run_wasm(tools, context):
                     runner.kill()
 
 
+def report_review(review):
+    if output := os.environ.get("GITHUB_OUTPUT"):
+        with open(output, "a", encoding="utf-8") as stream:
+            print(f"url={review['html_url']}", file=stream)
+
+
 def main():
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     if (os.environ["GITHUB_EVENT_NAME"] != "pull_request_target"
@@ -290,11 +296,12 @@ def main():
     url = f"{API}/repos/{repo}/pulls/{number}"
     run_id = int(os.environ["GITHUB_RUN_ID"])
     marker = f"<!-- wreview-run:{run_id} -->"
-    if any(review.get("user", {}).get("login") == "github-actions[bot]"
-           and (review.get("body") or "").endswith(marker)
-           for review in pages(f"{url}/reviews", token)):
-        print("Review already posted for this run")
-        return
+    for review in pages(f"{url}/reviews", token):
+        if (review.get("user", {}).get("login") == "github-actions[bot]"
+            and (review.get("body") or "").endswith(marker)):
+            report_review(review)
+            print("Review already posted for this run")
+            return
 
     def still_current():
         current = request(url, token=token)
@@ -332,6 +339,7 @@ def main():
     result = request(f"{url}/reviews", {
         **review, "event": "COMMENT", "commit_id": context["head_sha"],
     }, token=token)
+    report_review(result)
     print(f"Posted review {result['id']} on PR #{number}")
 
 
