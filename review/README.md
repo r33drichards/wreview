@@ -26,6 +26,9 @@ manager where applicable.
 - `GITHUB_WEBHOOK_SECRET` is the secret also configured on the GitHub webhook.
 - `RUNNER_API_TOKEN` matches the Wasmer app secret.
 - `WASMER_REVIEW_URL` is the Wasmer app's HTTPS origin.
+- Set `CHATGPT_ACCESS_TOKEN` and `OPENAI_MODEL` on the worker to run model
+  steps directly when model responses can exceed Wasmer's request deadline.
+  Use the runner's ChatGPT access token and replace it before it expires.
 - `REVIEW_DB` is a SQLite file path on the mounted volume.
 - `MCP_JS_URL` is the private HTTP origin of mcp-js. Enable directory heap
   storage with `--heap-store dir --heap-dir /tmp/wreview-heaps`.
