@@ -5,13 +5,15 @@ import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import urllib.error
+import urllib.request
 import secrets
 import sqlite3
 from threading import Event, Thread
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from run import API, PROMPT, TOOLS, ReviewTools, js, pages, request
+from run import API, PROMPT, TOOLS, NoRedirect, ReviewTools, js, pages, request
 
 
 class Worker:
@@ -177,6 +179,38 @@ class Worker:
             **review, "event": "COMMENT", "commit_id": pr["head"],
         }, token=self.token)
 
+    def model_step(self, messages):
+        token = os.environ.get("CHATGPT_ACCESS_TOKEN")
+        if not token:
+            return request(f"{self.runner}/model-step", {
+                "messages": messages, "tools": TOOLS,
+            }, token=self.runner_token, timeout=60)
+        payload = {
+            "model": os.environ["OPENAI_MODEL"], "input": messages, "store": False,
+            "stream": True, "include": ["reasoning.encrypted_content"],
+            "tools": [{"type": "function", "name": tool["name"], "description": tool["description"],
+                       "parameters": tool["inputSchema"], "strict": False} for tool in TOOLS],
+        }
+        call = urllib.request.Request("https://api.openai.com/v1/responses", json.dumps(payload).encode(),
+                                      {"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.build_opener(NoRedirect()).open(call, timeout=180) as response:
+                data = []
+                for line in response:
+                    if line.startswith(b"data:"):
+                        data.append(line[5:].strip())
+                    elif not line.strip() and data:
+                        event = json.loads(b"\n".join(data))
+                        data.clear()
+                        kind = event["type"]
+                        if kind == "response.completed":
+                            return event["response"]["output"]
+                        if kind in {"response.failed", "response.incomplete", "error"}:
+                            raise RuntimeError(f"OpenAI response ended with {kind}")
+        except urllib.error.HTTPError as error:
+            raise RuntimeError(f"OpenAI Responses API returned HTTP {error.code}") from None
+        raise RuntimeError("OpenAI response stream ended before completion")
+
     def run_model(self, tools, repo, pr):
         messages = [
             {"role": "developer", "content": PROMPT.read_text()},
@@ -184,9 +218,7 @@ class Worker:
         ]
         ids = set()
         for _ in range(20):
-            output = request(f"{self.runner}/model-step", {
-                "messages": messages, "tools": TOOLS,
-            }, token=self.runner_token, timeout=60)
+            output = self.model_step(messages)
             calls = []
             for item in output:
                 if item["type"] != "function_call":
