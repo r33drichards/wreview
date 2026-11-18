@@ -214,8 +214,9 @@ explicit and are not silently run on HTTP startup.
 In the GitHub repository, add `CHATGPT_ACCESS_TOKEN` as an Actions secret and
 `OPENAI_MODEL` as an Actions variable. Use an access token issued by the
 runner's Sign in with ChatGPT flow and a model listed for that account. Rotate
-the token when it expires. GitHub Actions supplies the PR-scoped write
-credential for the review job.
+the token when it expires. The workflow does not refresh it, so replace the
+Actions secret before requesting a review if the token has expired. GitHub
+Actions supplies the PR-scoped write credential for the review job.
 
 Create the `wreview` repository label and add it to an open PR after the
 workflow is on its base branch. The workflow uses GitHub's
