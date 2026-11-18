@@ -1,0 +1,22 @@
+name: Read-only Wasmer diagnostics
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Wasmer
+        run: |
+          curl --fail --silent --show-error --location https://get.wasmer.io -o "$RUNNER_TEMP/install-wasmer.sh"
+          sh "$RUNNER_TEMP/install-wasmer.sh" v7.5.0
+          echo "$HOME/.wasmer/bin" >> "$GITHUB_PATH"
+      - name: Read app access without publishing or deploying
+        env:
+          WASMER_TOKEN: ${{ secrets.WASMER_TOKEN }}
+        run: python3 scripts/deploy_wasmer.py --diagnose-only

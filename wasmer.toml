@@ -1,0 +1,16 @@
+[package]
+name = "r33drichards/minimal-mcp-agent"
+version = "0.1.0"
+description = "Minimal Rust agent with MCP tools and an authenticated HTTP interface"
+repository = "https://github.com/r33drichards/minimal-mcp-agent"
+entrypoint = "minimal-mcp-agent"
+
+[[module]]
+name = "minimal-mcp-agent"
+source = "dist/minimal-mcp-agent.wasm"
+abi = "wasi"
+
+[[command]]
+name = "minimal-mcp-agent"
+module = "minimal-mcp-agent"
+runner = "https://webc.org/runner/wasi"

@@ -1,0 +1,14 @@
+kind: wasmer.io/App.v0
+app_id: da_nBBIbtXUDZZG
+owner: r33drichards
+name: minimal-mcp-agent
+package: .
+cli_args:
+  - serve
+env:
+  PORT: "8080"
+debug: false
+redirect:
+  force_https: true
+# Put RUNNER_API_TOKEN, CHATGPT_ACCESS_TOKEN and MCP OAuth access tokens in
+# Wasmer Secrets, never in this file. Configure OPENAI_MODEL and MCP_URL there too.

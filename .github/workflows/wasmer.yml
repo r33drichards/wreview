@@ -1,0 +1,97 @@
+name: Test and deploy Wasmer
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: wasmer-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: local-ci-only
+          MYSQL_DATABASE: agent_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -plocal-ci-only"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: python3 -m unittest discover -s tests -p "test_deploy_wasmer.py"
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo test --locked --features mysql-backend
+      - run: cargo clippy --locked --all-targets --features mysql-backend -- -D warnings
+      - name: Real MySQL transactions, fencing and recovery
+        env:
+          MYSQL_TEST_URL: mysql://root:local-ci-only@127.0.0.1:3306/agent_test
+        run: cargo test --locked --features mysql-backend --test mysql -- --ignored --skip verified_tls
+      - run: cargo build --locked && python3 tests/mcp_smoke.py
+  wasix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      AGENT_COMMIT_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: wasix-org/cargo-wasix@v0.1.34
+        with:
+          toolchain-version: v2026-09-18.1+rust-1.97
+      - name: Install Wasmer and WASI SDK
+        run: |
+          curl --fail --silent --show-error --location https://get.wasmer.io -o "$RUNNER_TEMP/install-wasmer.sh"
+          sh "$RUNNER_TEMP/install-wasmer.sh" v7.5.0
+          echo "$HOME/.wasmer/bin" >> "$GITHUB_PATH"
+          curl --fail --silent --show-error --location https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz -o "$RUNNER_TEMP/wasi-sdk.tar.gz"
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin" >> "$GITHUB_PATH"
+          echo "CC_wasm32_wasmer_wasi=$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/clang" >> "$GITHUB_ENV"
+      - run: python3 scripts/build_wasix.py --features mysql-backend
+      - run: python3 tests/mcp_smoke.py --wasmer dist/minimal-mcp-agent.wasm
+      - run: wasmer package build --check
+      - name: Record artifact provenance
+        run: |
+          printf '%s\n' "$AGENT_COMMIT_SHA" > dist/commit.txt
+          sha256sum dist/minimal-mcp-agent.wasm > dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasix-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+  deploy:
+    needs: [test, wasix]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasix-${{ github.sha }}
+          path: dist/
+      - name: Verify artifact provenance
+        run: |
+          test "$(cat dist/commit.txt)" = "$GITHUB_SHA"
+          sha256sum --check dist/SHA256SUMS
+      - name: Install Wasmer
+        run: |
+          curl --fail --silent --show-error --location https://get.wasmer.io -o "$RUNNER_TEMP/install-wasmer.sh"
+          sh "$RUNNER_TEMP/install-wasmer.sh" v7.5.0
+          echo "$HOME/.wasmer/bin" >> "$GITHUB_PATH"
+      - name: Deploy and verify commit and access control
+        env:
+          WASMER_TOKEN: ${{ secrets.WASMER_TOKEN }}
+        run: python3 scripts/deploy_wasmer.py
