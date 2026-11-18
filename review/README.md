@@ -45,5 +45,31 @@ and only accepts events from its configured installation and owner.
 Use the Wasmer webhook URL for the GitHub App and disable individual
 repository hooks after confirming the app delivers events. The existing
 worker credential posts reviews. Apply the `wreview` label to opt in a PR. Each delivery has one status comment and at most one
-review. The model receives PR data and a delivery-scoped tool interface.
+review. Once GitHub accepts the review, wreview removes the label. The model receives PR data and a delivery-scoped tool interface.
 GitHub write operations happen in the worker.
+
+## Wasmer execution and recovery
+
+Build with `python3 scripts/build_wasix.py --features wasmer-review`. Use
+`review/wasmer-app.yaml` as the Wasmer app manifest beside the built package.
+The app uses its managed Postgres credentials to persist signed delivery IDs
+and starts a per-delivery Rust harness session immediately after acknowledgment.
+For Wasmer Postgres, set `REVIEW_DB_CA_DER_BASE64` to the base64-encoded
+DER certificate of the database CA and `REVIEW_DB_TLS_NAME` to the hostname
+covered by the database certificate. The client still connects to `DB_HOST`
+and `DB_PORT`. Update the pin when the database CA changes.
+
+The scheduled `review-reconcile` command uses `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY` to check the GitHub App delivery history. Set
+`GITHUB_APP_RECONCILE_AFTER` to the UTC cutover timestamp so the initial scan
+doesn't enqueue previously handled labels. The scheduled job also retries
+unfinished records. Postgres advisory locks serialize reviews for the same PR
+across webhook instances and scheduled jobs. Unrelated PRs may run in parallel.
+
+Set `GITHUB_APP_WEBHOOK_SECRET`, `GITHUB_APP_REPOSITORY_OWNER`,
+`GITHUB_APP_INSTALLATION_ID`, `GITHUB_REVIEW_TOKEN`, `OPENAI_MODEL`, and
+`CHATGPT_ACCESS_TOKEN` as Wasmer secrets. GitHub writes and model calls are
+made from Wasmer. Set `REVIEW_MCP_URL` and `REVIEW_MCP_TOKEN` for the
+authenticated connection to the private mcp-js deployment. The Railway
+service can serve only this relay by setting `REVIEW_MCP_RELAY_ONLY=true`,
+after pending work from the old deployment has drained.

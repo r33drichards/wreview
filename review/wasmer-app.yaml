@@ -1,0 +1,24 @@
+kind: wasmer.io/App.v0
+owner: r33drichards
+name: wreview-edge
+package: .
+cli_args: [review-webhook]
+env:
+  PORT: "8080"
+debug: false
+redirect:
+  force_https: true
+capabilities:
+  database:
+    engine: postgres
+locality:
+  regions:
+    - fr-roub1
+jobs:
+  - name: review-reconciliation
+    trigger: "1m"
+    timeout: "10m"
+    max_schedule_drift: "1m"
+    action:
+      execute:
+        cli_args: [review-reconcile]
