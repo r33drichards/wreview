@@ -30,7 +30,17 @@ manager where applicable.
 - `MCP_JS_URL` is the private HTTP origin of mcp-js. Enable directory heap
   storage with `--heap-store dir --heap-dir /tmp/wreview-heaps`.
 
-Configure the GitHub webhook for pull request events and send a ping before
-applying the label. Each delivery has one status comment and at most one
+For account-wide coverage, register a private GitHub App subscribed to pull
+request events with Pull requests read permission. Install it on **All
+repositories** for the repository owner. This route uses a separate secret
+and only accepts events from its configured installation and owner.
+
+- `GITHUB_APP_WEBHOOK_SECRET` is the GitHub App webhook secret.
+- `GITHUB_APP_REPOSITORY_OWNER` is the owner login.
+- `GITHUB_APP_INSTALLATION_ID` is the GitHub App installation ID.
+
+Use the Wasmer webhook URL for the GitHub App and disable individual
+repository hooks after confirming the app delivers events. The existing
+worker credential posts reviews. Apply the `wreview` label to opt in a PR. Each delivery has one status comment and at most one
 review. The model receives PR data and a delivery-scoped tool interface.
 GitHub write operations happen in the worker.
