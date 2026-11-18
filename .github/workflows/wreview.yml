@@ -10,8 +10,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  start:
     if: github.event.label.name == 'wreview'
+    permissions:
+      pull-requests: write
+    runs-on: ubuntu-24.04
+    outputs:
+      comment_id: ${{ steps.comment.outputs.id }}
+    steps:
+      - name: Post review status
+        id: comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          marker="<!-- wreview-status:$GITHUB_RUN_ID -->"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body=$(printf 'wreview is starting. [Follow the workflow run](%s).\n\n%s' "$run_url" "$marker")
+          comments="repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+          id=$(gh api --paginate "$comments" | jq -sr --arg marker "$marker" '
+            [ .[][] | select(.user.login == "github-actions[bot]" and (.body | endswith($marker))) ][0].id // empty')
+          if [[ -n "$id" ]]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$body" --silent
+          else
+            id=$(gh api --method POST "$comments" -f body="$body" --jq .id)
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: start
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -29,6 +56,7 @@ jobs:
         run: |
           curl --fail --silent --show-error --location https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz -o "$RUNNER_TEMP/wasi-sdk.tar.gz"
           tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin" >> "$GITHUB_PATH"
           echo "CC_wasm32_wasmer_wasi=$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/clang" >> "$GITHUB_ENV"
       - run: python3 scripts/build_wasix.py
       - uses: actions/upload-artifact@v4
@@ -44,6 +72,8 @@ jobs:
       pull-requests: write
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    outputs:
+      review_url: ${{ steps.review.outputs.url }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,6 +94,7 @@ jobs:
             wholelottahoopla/mcp-js:0.22.0@sha256:d08ea2be9efec96a613ae2ac480b1ff8dfe405e0b3a69b470b599ca1788f72be --http-port 8080 --heap-store dir --heap-dir /tmp/wreview-heaps
           curl --fail --silent --show-error --retry 15 --retry-connrefused http://127.0.0.1:8091/api/executions
       - name: Review labeled PR
+        id: review
         env:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -71,3 +102,29 @@ jobs:
           CHATGPT_ACCESS_TOKEN: ${{ secrets.CHATGPT_ACCESS_TOKEN }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
         run: python3 review/run.py
+
+  finish:
+    needs: [start, build, review]
+    if: always() && needs.start.result == 'success'
+    permissions:
+      pull-requests: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Update review status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ needs.start.outputs.comment_id }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          REVIEW_URL: ${{ needs.review.outputs.review_url }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [[ -n "$REVIEW_URL" ]]; then
+            status="wreview finished. [Read the review]($REVIEW_URL)."
+          elif [[ "$REVIEW_RESULT" == success ]]; then
+            status="wreview finished without posting a review."
+          else
+            status="wreview ended (build: $BUILD_RESULT, review: $REVIEW_RESULT)."
+          fi
+          body=$(printf '%s [Workflow run](%s).\n\n<!-- wreview-status:%s -->' "$status" "$run_url" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID" -f body="$body" --silent
