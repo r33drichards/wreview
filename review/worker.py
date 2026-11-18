@@ -17,6 +17,10 @@ from run import API, PROMPT, TOOLS, ReviewTools, js, pages, request
 class Worker:
     def __init__(self):
         self.repo = os.environ["GITHUB_REPOSITORY"]
+        self.repos = {self.repo} | {
+            repo.strip() for repo in os.environ.get("GITHUB_ADDITIONAL_REPOSITORIES", "").split(",")
+            if repo.strip()
+        }
         self.token = os.environ["GITHUB_REVIEW_TOKEN"]
         self.secret = os.environ["GITHUB_WEBHOOK_SECRET"].encode()
         self.runner_token = os.environ["RUNNER_API_TOKEN"]
@@ -52,12 +56,13 @@ class Worker:
             if event["action"] != "labeled" or event["label"]["name"] != "wreview":
                 return 204
             pr = event["pull_request"]
-            if event["repository"]["full_name"] != self.repo or pr["base"]["repo"]["full_name"] != self.repo:
+            repo = event["repository"]["full_name"]
+            if repo not in self.repos or pr["base"]["repo"]["full_name"] != repo:
                 return 403
             if type(pr["number"]) is not int or pr["number"] < 1:
                 return 400
             payload = {key: pr[key] for key in ("number", "changed_files")}
-            payload.update(head=pr["head"]["sha"], base=pr["base"]["sha"])
+            payload.update(repo=repo, head=pr["head"]["sha"], base=pr["base"]["sha"])
         except (KeyError, TypeError, ValueError):
             return 400
         with closing(self.connect()) as db, db:
@@ -87,7 +92,10 @@ class Worker:
 
     def review(self, delivery, pr):
         number = pr["number"]
-        root = f"{API}/repos/{self.repo}"
+        repo = pr.get("repo", self.repo)
+        if repo not in self.repos:
+            return
+        root = f"{API}/repos/{repo}"
         pull = f"{root}/pulls/{number}"
         comments = f"{root}/issues/{number}/comments"
         marker = f"<!-- wreview-delivery:{delivery} -->"
@@ -117,7 +125,7 @@ class Worker:
                 files = [{key: file[key] for key in ("filename", "status", "patch", "previous_filename")
                           if key in file} for file in pages(f"{pull}/files", self.token)]
                 if current():
-                    posted = self.run_review(delivery, pr, files, current, pull, marker)
+                    posted = self.run_review(delivery, repo, pr, files, current, pull, marker)
             message = "wreview finished without posting a review because the pull request changed."
             if posted is not None:
                 message = f"wreview finished. [Read the review]({posted['html_url']})."
@@ -126,8 +134,8 @@ class Worker:
             raise
         github(status_url, {"body": f"{message}\n\n{status_marker}"}, method="PATCH")
 
-    def run_review(self, delivery, pr, files, current, pull, marker):
-        context = {"repo": self.repo, "number": pr["number"], "base_sha": pr["base"],
+    def run_review(self, delivery, repo, pr, files, current, pull, marker):
+        context = {"repo": repo, "number": pr["number"], "base_sha": pr["base"],
                    "head_sha": pr["head"], "files_available": len(files),
                    "files_reported": pr["changed_files"],
                    "files_without_patches": sum("patch" not in file for file in files)}
@@ -144,7 +152,7 @@ class Worker:
             # Wasmer returns an empty body on success.
             request(f"{self.runner}/turn", {
                 "capability": capability, "instructions": PROMPT.read_text(),
-                "input": f"Review {self.repo} pull request #{pr['number']} at {pr['head']}.",
+                "input": f"Review {repo} pull request #{pr['number']} at {pr['head']}.",
                 "tools": TOOLS,
             }, token=self.runner_token, timeout=600)
         finally:

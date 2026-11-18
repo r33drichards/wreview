@@ -17,7 +17,10 @@ Deploy `review/Dockerfile` with the repository root as its build context.
 Set these worker environment variables using the hosting service's secrets
 manager where applicable.
 
-- `GITHUB_REPOSITORY` is the single allowed repository in owner/name form.
+- `GITHUB_REPOSITORY` is the primary allowed repository in owner/name form.
+- `GITHUB_ADDITIONAL_REPOSITORIES` optionally lists additional allowed
+  repositories as comma-separated owner/name entries. Configure the signed
+  webhook on each repository you enable.
 - `GITHUB_REVIEW_TOKEN` is a fine-grained GitHub token for that repository
   with pull request write permission. The review is attributed to its owner.
 - `GITHUB_WEBHOOK_SECRET` is the secret also configured on the GitHub webhook.
