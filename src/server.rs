@@ -153,7 +153,7 @@ fn serve_http(mut handle_body: impl FnMut(&[u8]) -> (u16, Value)) -> Result<()> 
 
 // Compare every expected byte without early exit on a mismatch. Secret length is
 // not hidden; the comparison result does not reveal matching token prefixes.
-fn authorized(header: &str, expected: &str) -> bool {
+pub(crate) fn authorized(header: &str, expected: &str) -> bool {
     let Some(supplied) = header.strip_prefix("Bearer ") else {
         return false;
     };

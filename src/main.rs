@@ -6,6 +6,7 @@ mod auth;
 mod auth;
 mod config;
 mod model;
+mod review;
 mod server;
 
 use anyhow::{Context, Result, bail};
@@ -27,6 +28,7 @@ use std::{
 
 fn main() -> Result<()> {
     match env::args().nth(1).as_deref() {
+        Some("review") => return review::serve(),
         Some("login") => return auth::login(),
         Some("logout") => return auth::logout(),
         Some("models") => {
