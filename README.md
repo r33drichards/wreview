@@ -208,3 +208,23 @@ a failed request under a new ID.
 contract. Interactive CLI history remains ephemeral. Backend credentials belong
 in secret environment variables, never source control. Database migrations are
 explicit and are not silently run on HTTP startup.
+
+## Review a GitHub pull request
+
+In the GitHub repository, add `CHATGPT_ACCESS_TOKEN` as an Actions secret and
+`OPENAI_MODEL` as an Actions variable. Use an access token issued by the
+runner's Sign in with ChatGPT flow and a model listed for that account. Rotate
+the token when it expires. GitHub Actions supplies the PR-scoped write
+credential for the review job.
+
+Create the `wreview` repository label and add it to an open PR after the
+workflow is on its base branch. The workflow uses GitHub's
+`pull_request_target:labeled` event and checks out the trusted base commit.
+It reads changed files through the GitHub API, prepares an isolated mcp-js
+snapshot, runs one WASM turn, and publishes a comment-only review. The
+review body provides general feedback and inline comments target changed
+lines. PR branches, including forks, are read as data.
+
+The Actions run reports the review ID or why publication was skipped. A
+rerun reconciles an existing review from the same run. Remove and reapply
+`wreview` to request a new review at the current commit.

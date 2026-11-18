@@ -5,7 +5,7 @@ permissions:
   contents: read
 jobs:
   diagnose:
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'r33drichards/minimal-mcp-agent' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: production

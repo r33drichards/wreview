@@ -72,7 +72,7 @@ jobs:
           if-no-files-found: error
   deploy:
     needs: [test, wasix]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.repository == 'r33drichards/minimal-mcp-agent' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: production

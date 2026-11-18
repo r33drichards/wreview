@@ -74,6 +74,21 @@ fn random() -> String {
     OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
+fn new_host_id() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = format!("{:032x}", u128::from_be_bytes(bytes));
+    format!(
+        "urn:uuid:{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
 fn challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
@@ -134,7 +149,7 @@ fn load(dir: &Path) -> Result<Store> {
     reject_symlink(&path)?;
     if !path.exists() {
         return Ok(Store {
-            host_id: format!("minimal-mcp-agent:{}", random()),
+            host_id: new_host_id(),
             ..Store::default()
         });
     }
@@ -202,6 +217,9 @@ pub fn login() -> Result<()> {
     let dir = store_dir()?;
     let _lock = lock(&dir)?;
     let mut store = load(&dir)?;
+    if store.accounts.is_empty() && store.host_id.starts_with("minimal-mcp-agent:") {
+        store.host_id = new_host_id();
+    }
     save(&dir, &store)?; // Persist the stable host ID before its first authorization.
     let selected = choose_account(&store)?;
     let old = selected.map(|i| &store.accounts[i]);
