@@ -118,6 +118,18 @@ for line in ('            stream.set_nodelay(true).map_err(Error::connect)?;',
              '            if let Some(keepalive_config) = keepalive_config {'):
     assert line in socket_source
     socket_source = socket_source.replace(line, '            #[cfg(not(target_os = "wasi"))]\n' + line)
+# WASIX can block when Tokio reads an empty socket after the TLS reply.
+# Set nonblocking explicitly before the connected socket enters the driver.
+tcp_connect = '                connect_with_timeout(TcpStream::connect((*ip, port)), connect_timeout).await?;'
+assert tcp_connect in socket_source
+socket_source = socket_source.replace(tcp_connect, tcp_connect + """
+            #[cfg(target_os = "wasi")]
+            let stream = {
+                let stream = stream.into_std().map_err(Error::connect)?;
+                stream.set_nonblocking(true).map_err(Error::connect)?;
+                TcpStream::from_std(stream).map_err(Error::connect)?
+            };
+""")
 socket.write_text(socket_source)
 
 manifest += '\n[patch.crates-io]\nrmcp = { path = "../rmcp" }\ntokio-postgres = { path = "../tokio-postgres" }\n'

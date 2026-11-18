@@ -16,9 +16,10 @@ locality:
     - fr-roub1
 jobs:
   - name: review-reconciliation
-    trigger: "1m"
+    trigger: '* * * * *'
     timeout: "10m"
     max_schedule_drift: "1m"
     action:
       execute:
+        command: minimal-mcp-agent
         cli_args: [review-reconcile]
