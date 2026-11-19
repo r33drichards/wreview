@@ -73,3 +73,13 @@ made from Wasmer. Set `REVIEW_MCP_URL` and `REVIEW_MCP_TOKEN` for the
 authenticated connection to the private mcp-js deployment. The Railway
 service can serve only this relay by setting `REVIEW_MCP_RELAY_ONLY=true`,
 after pending work from the old deployment has drained.
+
+
+### Direct mcp-js on Railway
+
+Deploy the Dockerfile in `review/mcp-js` to the mcp-js service. Start it
+with `/bin/sh /opt/wreview/start.sh`, enable Serverless, and route the
+public Railway domain to port 8081. Set the same `REVIEW_MCP_TOKEN` in
+Railway and Wasmer. Set the Wasmer `REVIEW_MCP_URL` to the Railway HTTPS
+domain followed by `/review-mcp`. Port 8080 is used by the local proxy
+and should have no public route.

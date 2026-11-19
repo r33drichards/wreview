@@ -465,15 +465,21 @@ impl Service {
 
     fn mcp(&self, path: &str, payload: Option<Value>) -> Result<Value> {
         let url = format!("{}{path}", self.mcp_url);
-        let request = match payload {
-            Some(payload) => self.http.post(url).json(&payload),
-            None => self.http.get(url),
-        };
-        Ok(request
-            .bearer_auth(&self.mcp_token)
-            .send()?
-            .error_for_status()?
-            .json()?)
+        for attempt in 0..3 {
+            let request = match &payload {
+                Some(payload) => self.http.post(&url).json(payload),
+                None => self.http.get(&url),
+            };
+            let response = request.bearer_auth(&self.mcp_token).send()?;
+            // Railway can return 502 while waking mcp-js. The review's JavaScript
+            // only seeds or reads its own snapshot, so these calls can be retried.
+            if attempt < 2 && matches!(response.status().as_u16(), 502..=504) {
+                thread::sleep(Duration::from_secs(1 << attempt));
+                continue;
+            }
+            return Ok(response.error_for_status()?.json()?);
+        }
+        unreachable!("the final attempt returns")
     }
 
     fn js(&self, session: &str, code: String, heap: Option<&Value>) -> Result<(String, Value)> {
