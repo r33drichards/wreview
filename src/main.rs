@@ -35,6 +35,13 @@ fn main() -> Result<()> {
         #[cfg(feature = "wasmer-review")]
         Some("review-reconcile") => return wasmer_review::reconcile(),
         #[cfg(feature = "wasmer-review")]
+        Some("review-delivery") => {
+            let id = std::env::args()
+                .nth(2)
+                .context("Missing GitHub delivery ID")?;
+            return wasmer_review::run_delivery(&id);
+        }
+        #[cfg(feature = "wasmer-review")]
         Some("review-migrate") => return wasmer_review::migrate(),
         Some("review") => return review::serve(),
         Some("login") => return auth::login(),

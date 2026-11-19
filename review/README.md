@@ -53,7 +53,11 @@ GitHub write operations happen in the worker.
 Build with `python3 scripts/build_wasix.py --features wasmer-review`. Use
 `review/wasmer-app.yaml` as the Wasmer app manifest beside the built package.
 The app uses its managed Postgres credentials to persist signed delivery IDs
-and starts a per-delivery Rust harness session immediately after acknowledgment.
+and launches a Wasmer one-time execution job for each new review delivery.
+The job runs `minimal-mcp-agent review-delivery <delivery-id>` independently
+of the webhook instance. Set `WREVIEW_WASMER_APP_ID` to the target app ID
+and `WREVIEW_WASMER_JOB_TOKEN` to a dedicated Wasmer API token as an app
+secret. The webhook acknowledges the delivery after Wasmer accepts the job.
 For Wasmer Postgres, set `REVIEW_DB_CA_DER_BASE64` to the base64-encoded
 DER certificate of the database CA and `REVIEW_DB_TLS_NAME` to the hostname
 covered by the database certificate. The client still connects to `DB_HOST`

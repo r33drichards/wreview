@@ -14,10 +14,7 @@ use std::{
     env,
     io::Read,
     net::ToSocketAddrs,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -25,7 +22,6 @@ use tiny_http::{Method, Request, Response, Server, StatusCode};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 const API: &str = "https://api.github.com";
-const LIMIT: usize = 3;
 const PROMPT: &str = include_str!("../review/prompt.md");
 
 #[derive(Serialize, Deserialize)]
@@ -188,6 +184,28 @@ impl Service {
         }))
     }
 
+    fn launch_delivery(&self, id: &str) -> Result<()> {
+        let token = env::var("WREVIEW_WASMER_JOB_TOKEN").context("Missing Wasmer job token")?;
+        let app = env::var("WREVIEW_WASMER_APP_ID").context("Missing Wasmer app ID")?;
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let response: Value = self.http.post("https://registry.wasmer.io/graphql")
+            .bearer_auth(token)
+            .json(&json!({
+                "query": "mutation($input:CreateCronJobInput!){createCronJob(input:$input){cronJob{id}}}",
+                "variables": {"input": {
+                    "appId": app, "name": format!("review-{id}-{nonce}"),
+                    "trigger": "ONE_TIME", "runNow": true, "timeout": "8m",
+                    "execute": {"command": "minimal-mcp-agent", "cliArgs": ["review-delivery", id]}
+                }}
+            }))
+            .send()?.error_for_status()?.json()?;
+        ensure!(
+            response["data"]["createCronJob"]["cronJob"]["id"].is_string(),
+            "Wasmer declined to dispatch the review job"
+        );
+        Ok(())
+    }
+
     fn record_delivery(
         &self,
         id: &str,
@@ -295,7 +313,13 @@ impl Service {
         }
         review_log("review_started", id, &job);
         let result = self.review(&mut db, id, &job);
-        if self.check_active(id).is_err() {
+        let cancelled: bool = db
+            .query_one(
+                "SELECT cancelled FROM wreview_jobs WHERE delivery=$1",
+                &[&id],
+            )?
+            .get(0);
+        if cancelled {
             return Ok(());
         }
         match result {
@@ -321,6 +345,7 @@ impl Service {
                     "UPDATE wreview_jobs SET next_attempt=now()+make_interval(mins=>least(30,attempts*2))
                      WHERE delivery=$1", &[&id],
                 )?;
+                return Err(err);
             }
         }
         Ok(())
@@ -496,42 +521,46 @@ pub fn reconcile() -> Result<()> {
     Ok(())
 }
 
+pub fn run_delivery(id: &str) -> Result<()> {
+    ensure!(delivery_id(id), "Invalid GitHub delivery ID");
+    Service::new()?.run(id)
+}
+
 pub fn serve() -> Result<()> {
     let service = Arc::new(Service::new()?);
     service.migrate()?;
-    let active = Arc::new(AtomicUsize::new(0));
     let port: u16 = env::var("PORT").unwrap_or_else(|_| "8080".into()).parse()?;
     let server = Server::http(("0.0.0.0", port)).map_err(|e| anyhow::anyhow!("{e}"))?;
     for mut req in server.incoming_requests() {
         let outcome = match (req.method(), req.url()) {
-            (&Method::Get, "/health") => Ok((200, None)),
-            (&Method::Post, "/github/webhook") => (|| -> Result<(u16, Option<String>)> {
+            (&Method::Get, "/health") => Ok(200),
+            (&Method::Post, "/github/webhook") => (|| -> Result<u16> {
                 let mut body = Vec::new();
                 req.as_reader().take(1_048_577).read_to_end(&mut body)?;
                 if body.len() > 1_048_576 {
-                    return Ok((413, None));
+                    return Ok(413);
                 }
                 if !authenticate(
                     &service.webhook_secret,
                     &body,
                     header(&req, "X-Hub-Signature-256"),
                 ) {
-                    return Ok((401, None));
+                    return Ok(401);
                 }
                 if header(&req, "X-GitHub-Event").as_deref() != Some("pull_request") {
-                    return Ok((204, None));
+                    return Ok(204);
                 }
                 let Ok(event) = serde_json::from_slice(&body) else {
-                    return Ok((400, None));
+                    return Ok(400);
                 };
                 let job = match service.decode_event(&event) {
                     Ok(Some(job)) => job,
-                    Ok(None) => return Ok((204, None)),
-                    Err(_) => return Ok((403, None)),
+                    Ok(None) => return Ok(204),
+                    Err(_) => return Ok(403),
                 };
                 let Some(id) = header(&req, "X-GitHub-Delivery").filter(|id| delivery_id(id))
                 else {
-                    return Ok((400, None));
+                    return Ok(400);
                 };
                 review_log("webhook_received", &id, &job);
                 let removed = event["action"] == "unlabeled";
@@ -547,29 +576,20 @@ pub fn serve() -> Result<()> {
                     });
                 }
                 if removed {
-                    return Ok((204, None));
+                    return Ok(204);
                 }
                 review_log("webhook_persisted", &id, &job);
-                Ok((202, Some(id)))
+                service.launch_delivery(&id)?;
+                review_log("review_job_dispatched", &id, &job);
+                Ok(202)
             })(),
-            _ => Ok((404, None)),
+            _ => Ok(404),
         };
-        let (status, job) = outcome.unwrap_or_else(|error| {
+        let status = outcome.unwrap_or_else(|error| {
             eprintln!("Webhook persistence failed: {error}");
-            (503, None)
+            503
         });
         let _ = req.respond(Response::empty(StatusCode(status)));
-        if let Some(id) = job.filter(|_| active.load(Ordering::Relaxed) < LIMIT) {
-            active.fetch_add(1, Ordering::Relaxed);
-            let active = Arc::clone(&active);
-            let service = Arc::clone(&service);
-            thread::spawn(move || {
-                if let Err(error) = service.run(&id) {
-                    eprintln!("Review {id} could not start: {error}");
-                }
-                active.fetch_sub(1, Ordering::Relaxed);
-            });
-        }
     }
     Ok(())
 }
