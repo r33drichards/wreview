@@ -98,6 +98,6 @@ Private archives require GitHub Contents read access.
 
 The checkout is released when the review turn ends and is reclaimed by the
 runtime if the job is terminated. It is never uploaded to the mcp-js
-snapshot store. Archives are capped at 32 MiB compressed and 128 MiB
+snapshot store. Archives are capped at 64 MiB compressed and 128 MiB
 expanded. The tools read UTF-8 regular files of up to 4 MiB. If the archive
 is unavailable, the review falls back to its existing patch tools.

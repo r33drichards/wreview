@@ -3,7 +3,7 @@ use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, io::Read, path::Component};
 
-pub const ARCHIVE_LIMIT: usize = 32 * 1024 * 1024;
+pub const ARCHIVE_LIMIT: usize = 64 * 1024 * 1024;
 const EXPANDED_LIMIT: u64 = 128 * 1024 * 1024;
 const FILE_LIMIT: u64 = 4 * 1024 * 1024;
 const ENTRY_LIMIT: usize = 50_000;

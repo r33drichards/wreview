@@ -724,8 +724,19 @@ impl Service {
                 review["html_url"].as_str().context("Missing review URL")?
             ),
             Ok(None) => "wreview skipped because the pull request changed.".into(),
-            Err(_) => {
-                "wreview could not finish. Scheduled recovery will retry this delivery.".into()
+            Err(error) => {
+                let expired_model_credential =
+                    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                        error.status() == Some(reqwest::StatusCode::UNAUTHORIZED)
+                            && error
+                                .url()
+                                .is_some_and(|url| url.host_str() == Some("api.openai.com"))
+                    });
+                if expired_model_credential {
+                    "wreview could not finish. Refresh the model credential, then reapply the label or redeliver this webhook.".into()
+                } else {
+                    "wreview could not finish. Reapply the label or redeliver this webhook to retry.".into()
+                }
             }
         };
         self.write(
@@ -811,6 +822,7 @@ impl Service {
         let mut data = Vec::new();
         self.http
             .get(archive_url)
+            .timeout(Duration::from_secs(60))
             .send()
             .map_err(reqwest::Error::without_url)?
             .error_for_status()
@@ -832,8 +844,10 @@ impl Service {
                 review_log("checkout_ready", id, job);
                 Some(checkout)
             }
-            Err(_) => {
+            Err(error) => {
                 review_log("checkout_unavailable", id, job);
+                // Archive HTTP errors have their signed download URLs removed above.
+                eprintln!("Checkout unavailable for delivery {id}: {error}");
                 None
             }
         };
