@@ -45,5 +45,77 @@ and only accepts events from its configured installation and owner.
 Use the Wasmer webhook URL for the GitHub App and disable individual
 repository hooks after confirming the app delivers events. The existing
 worker credential posts reviews. Apply the `wreview` label to opt in a PR. Each delivery has one status comment and at most one
-review. The model receives PR data and a delivery-scoped tool interface.
+review. Once GitHub accepts the review, wreview removes the label. The model receives PR data and a delivery-scoped tool interface.
 GitHub write operations happen in the worker.
+
+## Wasmer execution and recovery
+
+Build with `python3 scripts/build_wasix.py --features wasmer-review`. Use
+`review/wasmer-app.yaml` as the Wasmer app manifest beside the built package.
+The app uses its managed Postgres credentials to persist signed delivery IDs
+and launches a Wasmer one-time execution job for each new review delivery.
+The job runs `minimal-mcp-agent review-delivery <delivery-id>` independently
+of the webhook instance. Set `WREVIEW_WASMER_APP_ID` to the target app ID
+and `WREVIEW_WASMER_JOB_TOKEN` to a dedicated Wasmer API token as an app
+secret. The webhook acknowledges the delivery after Wasmer accepts the job.
+For Wasmer Postgres, set `REVIEW_DB_CA_DER_BASE64` to the base64-encoded
+DER certificate of the database CA and `REVIEW_DB_TLS_NAME` to the hostname
+covered by the database certificate. The client still connects to `DB_HOST`
+and `DB_PORT`. Update the pin when the database CA changes.
+
+The scheduled `review-reconcile` command uses `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY` to check the GitHub App delivery history. Set
+`GITHUB_APP_RECONCILE_AFTER` to the UTC cutover timestamp so the initial scan
+doesn't enqueue previously handled labels. The scheduled job also retries
+unfinished records. Postgres advisory locks serialize reviews for the same PR
+across webhook instances and scheduled jobs. Unrelated PRs may run in parallel.
+
+Set `GITHUB_APP_WEBHOOK_SECRET`, `GITHUB_APP_REPOSITORY_OWNER`,
+`GITHUB_APP_INSTALLATION_ID`, `GITHUB_REVIEW_TOKEN`, `OPENAI_MODEL`, and
+`CHATGPT_ACCESS_TOKEN` as Wasmer secrets. GitHub writes and model calls are
+made from Wasmer. Set `REVIEW_MCP_URL` and `REVIEW_MCP_TOKEN` for the
+authenticated connection to the private mcp-js deployment. The Railway
+service can serve only this relay by setting `REVIEW_MCP_RELAY_ONLY=true`,
+after pending work from the old deployment has drained.
+
+
+### Direct mcp-js on Railway
+
+Deploy the Dockerfile in `review/mcp-js` to the mcp-js service. Start it
+with `/bin/sh /opt/wreview/start.sh`, enable Serverless, and route the
+public Railway domain to port 8081. Set the same `REVIEW_MCP_TOKEN` in
+Railway and Wasmer. Set the Wasmer `REVIEW_MCP_URL` to the Railway HTTPS
+domain followed by `/review-mcp`. Port 8080 is used by the local proxy
+and should have no public route.
+
+### Repository context
+
+The worker downloads a GitHub archive pinned to the PR head SHA, including
+for pull requests from forks. It exposes an in-memory, read-only checkout
+via `list_files`, `read_file`, and `search_text`. The model can inspect
+unchanged files while inline review anchors still come from the PR patch.
+Private archives require GitHub Contents read access.
+
+The checkout is released when the review turn ends and is reclaimed by the
+runtime if the job is terminated. It is never uploaded to the mcp-js
+snapshot store. Archives are capped at 64 MiB compressed and 128 MiB
+expanded. The tools read UTF-8 regular files of up to 4 MiB. If the archive
+is unavailable, the review falls back to its existing patch tools.
+
+### Hosted model credential refresh
+
+Set `WREVIEW_OAUTH_STORAGE_KEY` to a base64-encoded random 32-byte key in
+Wasmer secrets. Set `WREVIEW_OAUTH_GENERATION` to a positive integer and
+`WREVIEW_OAUTH_BOOTSTRAP` to the JSON containing the dedicated worker's
+`client_id`, `access_token`, `refresh_token`, `expires_at` (Unix seconds),
+and `scope` from its Sign in with ChatGPT session. Keep all credential
+values out of logs and version control.
+
+The worker encrypts session state in Postgres, serializes refreshes, and
+saves rotated credentials before using them. It refreshes on demand
+within one minute of expiry and retries a rejected model token once.
+Once the generation is stored, the bootstrap secret can be removed.
+To replace a revoked session, sign in again and provide the new bootstrap
+with a higher generation. Keep the database encryption key stable.
+Use a separate sign-in for local CLI activity so local refreshes do not
+race the worker's refresh token rotation.

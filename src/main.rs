@@ -1,3 +1,9 @@
+#[cfg(feature = "wasmer-review")]
+mod review_auth;
+#[cfg(feature = "wasmer-review")]
+mod review_checkout;
+#[cfg(feature = "wasmer-review")]
+mod wasmer_review;
 use minimal_mcp_agent::agent;
 #[cfg(unix)]
 mod auth;
@@ -28,6 +34,19 @@ use std::{
 
 fn main() -> Result<()> {
     match env::args().nth(1).as_deref() {
+        #[cfg(feature = "wasmer-review")]
+        Some("review-webhook") => return wasmer_review::serve(),
+        #[cfg(feature = "wasmer-review")]
+        Some("review-reconcile") => return wasmer_review::reconcile(),
+        #[cfg(feature = "wasmer-review")]
+        Some("review-delivery") => {
+            let id = std::env::args()
+                .nth(2)
+                .context("Missing GitHub delivery ID")?;
+            return wasmer_review::run_delivery(&id);
+        }
+        #[cfg(feature = "wasmer-review")]
+        Some("review-migrate") => return wasmer_review::migrate(),
         Some("review") => return review::serve(),
         Some("login") => return auth::login(),
         Some("logout") => return auth::logout(),
