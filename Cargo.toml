@@ -8,7 +8,7 @@ description = "A small Rust agent loop with MCP tools and Sign in with ChatGPT"
 [features]
 default = []
 mysql-backend = ["dep:mysql", "dep:rustls"]
-wasmer-review = ["dep:postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots", "dep:rustls", "dep:hmac"]
+wasmer-review = ["dep:postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots", "dep:rustls", "dep:hmac", "dep:flate2", "dep:tar"]
 
 [dependencies]
 base64 = "0.22"
@@ -25,6 +25,8 @@ tiny_http = "0.12"
 postgres = { version = "0.19", optional = true }
 tokio-postgres-rustls = { version = "0.13", default-features = false, optional = true }
 webpki-roots = { version = "1", optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
 hmac = { version = "0.12", optional = true }
 jsonwebtoken = "9"
 

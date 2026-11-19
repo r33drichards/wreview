@@ -87,3 +87,17 @@ public Railway domain to port 8081. Set the same `REVIEW_MCP_TOKEN` in
 Railway and Wasmer. Set the Wasmer `REVIEW_MCP_URL` to the Railway HTTPS
 domain followed by `/review-mcp`. Port 8080 is used by the local proxy
 and should have no public route.
+
+### Repository context
+
+The worker downloads a GitHub archive pinned to the PR head SHA, including
+for pull requests from forks. It exposes an in-memory, read-only checkout
+via `list_files`, `read_file`, and `search_text`. The model can inspect
+unchanged files while inline review anchors still come from the PR patch.
+Private archives require GitHub Contents read access.
+
+The checkout is released when the review turn ends and is reclaimed by the
+runtime if the job is terminated. It is never uploaded to the mcp-js
+snapshot store. Archives are capped at 32 MiB compressed and 128 MiB
+expanded. The tools read UTF-8 regular files of up to 4 MiB. If the archive
+is unavailable, the review falls back to its existing patch tools.

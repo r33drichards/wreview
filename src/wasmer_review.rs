@@ -1,4 +1,7 @@
-use crate::{config, model};
+use crate::{
+    config, model,
+    review_checkout::{ARCHIVE_LIMIT, Checkout},
+};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
@@ -759,10 +762,84 @@ impl Service {
         Ok(())
     }
 
+    fn checkout(&self, job: &Job) -> Result<Checkout> {
+        let pull = self.get(&format!("/repos/{}/pulls/{}", job.repo, job.number))?;
+        ensure!(pull["head"]["sha"] == job.head, "Pull request head changed");
+        let repo = pull["head"]["repo"]["full_name"]
+            .as_str()
+            .unwrap_or(&job.repo);
+        let (owner, name) = repo.split_once('/').context("Invalid head repository")?;
+        for part in [owner, name] {
+            ensure!(
+                !part.is_empty()
+                    && part != "."
+                    && part != ".."
+                    && part
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c)),
+                "Invalid head repository"
+            );
+        }
+        let redirect = self
+            .http
+            .get(format!("{API}/repos/{repo}/tarball/{}", job.head))
+            .header("User-Agent", "wreview")
+            .bearer_auth(&self.github_token)
+            .send()?
+            .error_for_status()?;
+        ensure!(
+            redirect.status().is_redirection(),
+            "GitHub archive redirect unavailable"
+        );
+        let archive_url = reqwest::Url::parse(
+            redirect
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .context("Missing GitHub archive location")?
+                .to_str()?,
+        )?;
+        ensure!(
+            archive_url.scheme() == "https"
+                && archive_url.host_str() == Some("codeload.github.com")
+                && archive_url.username().is_empty()
+                && archive_url.password().is_none()
+                && archive_url.port().is_none(),
+            "Unexpected GitHub archive location"
+        );
+        // The archive redirect carries its own access grant for private repositories.
+        // Never forward the GitHub review token and never log the signed URL.
+        let mut data = Vec::new();
+        self.http
+            .get(archive_url)
+            .send()
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?
+            .take((ARCHIVE_LIMIT + 1) as u64)
+            .read_to_end(&mut data)?;
+        ensure!(
+            data.len() <= ARCHIVE_LIMIT,
+            "Repository archive exceeds download limit"
+        );
+        Checkout::open(&data)
+    }
+
     fn model_review(&self, id: &str, job: &Job, files: &[Value]) -> Result<Value> {
+        self.check_active(id)?;
+        review_log("checkout_loading", id, job);
+        let checkout = match self.checkout(job) {
+            Ok(checkout) => {
+                review_log("checkout_ready", id, job);
+                Some(checkout)
+            }
+            Err(_) => {
+                review_log("checkout_unavailable", id, job);
+                None
+            }
+        };
         let session = format!("wreview-{id}");
         let context = json!({"repo":job.repo,"number":job.number,"head_sha":job.head,"base_sha":job.base,
-            "files_available":files.len(),"files_without_patches":files.iter().filter(|f| f["patch"].is_null()).count()});
+            "checkout_available":checkout.is_some(),"files_available":files.len(),"files_without_patches":files.iter().filter(|f| f["patch"].is_null()).count()});
         let data = serde_json::to_string(&json!({"context":context,"files":files}))?;
         self.check_active(id)?;
         review_log("mcp_seed_started", id, job);
@@ -805,6 +882,24 @@ impl Service {
                 &["index"],
             ),
             function(
+                "list_files",
+                "List paths at the reviewed commit by optional path prefix and entry offset.",
+                json!({"prefix":{"type":"string"},"offset":{"type":"integer"}}),
+                &[],
+            ),
+            function(
+                "read_file",
+                "Read a page of a UTF-8 file at the reviewed commit, including unchanged files. Offset is a zero-based line index.",
+                json!({"path":{"type":"string"},"offset":{"type":"integer"}}),
+                &["path"],
+            ),
+            function(
+                "search_text",
+                "Search UTF-8 files at the reviewed commit for a literal case-sensitive string. Optionally restrict to a path prefix and page by match offset.",
+                json!({"query":{"type":"string"},"prefix":{"type":"string"},"offset":{"type":"integer"}}),
+                &["query"],
+            ),
+            function(
                 "submit_review",
                 "Stage a comment-only review with optional changed-line comments.",
                 json!({"body":{"type":"string"},"comments":{"type":"array","items":{"type":"object",
@@ -817,7 +912,7 @@ impl Service {
         let anchors = anchors(files);
         let mut staged = None;
         let mut messages = vec![json!({"role":"developer","content":PROMPT})];
-        agent::run_turn(
+        let result = agent::run_turn(
             &mut messages,
             &format!(
                 "Review {} pull request #{} at {}.",
@@ -836,6 +931,18 @@ impl Service {
             |name, args| {
                 let args: Value = serde_json::from_str(args)?;
                 match name {
+                    "list_files" | "read_file" | "search_text" => {
+                        self.check_active(id)?;
+                        let checkout = checkout
+                            .as_ref()
+                            .context("Repository checkout unavailable")?;
+                        review_log(name, id, job);
+                        match name {
+                            "list_files" => checkout.list(&args),
+                            "read_file" => checkout.read(&args),
+                            _ => checkout.search(&args),
+                        }
+                    }
                     "pr_context" => read("reviewState.context"),
                     "changed_file" => {
                         let index = args["index"]
@@ -888,7 +995,12 @@ impl Service {
                 }
             },
             |_| {},
-        )?;
+        );
+        if checkout.is_some() {
+            drop(checkout);
+            review_log("checkout_released", id, job);
+        }
+        result?;
         staged.context("Model completed without submitting a review")
     }
 }

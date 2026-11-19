@@ -1,4 +1,6 @@
 #[cfg(feature = "wasmer-review")]
+mod review_checkout;
+#[cfg(feature = "wasmer-review")]
 mod wasmer_review;
 use minimal_mcp_agent::agent;
 #[cfg(unix)]
