@@ -36,6 +36,15 @@ struct Job {
     base: String,
 }
 
+fn review_log(event: &str, delivery: &str, job: &Job) {
+    println!(
+        "{}",
+        json!({
+            "event": event, "delivery": delivery, "repository": job.repo, "pr": job.number
+        })
+    );
+}
+
 struct Service {
     db: Config,
     tls: MakeRustlsConnect,
@@ -202,6 +211,7 @@ impl Service {
             )?
             .get(0);
         if !locked {
+            review_log("review_lock_busy", id, &job);
             return Ok(());
         }
         let claimed = db.execute(
@@ -212,15 +222,26 @@ impl Service {
         if claimed == 0 {
             return Ok(());
         }
-        match self.review(&mut db, id, job) {
+        review_log("review_started", id, &job);
+        match self.review(&mut db, id, &job) {
             Ok(()) => {
                 db.execute(
                     "UPDATE wreview_jobs SET done=true WHERE delivery=$1",
                     &[&id],
                 )?;
+                review_log("review_finished", id, &job);
             }
             Err(err) => {
-                eprintln!("Review {id} will be retried: {err}");
+                review_log("review_failed", id, &job);
+                if let Some(status) = err
+                    .downcast_ref::<reqwest::Error>()
+                    .and_then(|e| e.status())
+                {
+                    println!(
+                        "{}",
+                        json!({"event": "upstream_http_error", "delivery": id, "status": status.as_u16()})
+                    );
+                }
                 db.execute(
                     "UPDATE wreview_jobs SET next_attempt=now()+make_interval(mins=>least(30,attempts*2))
                      WHERE delivery=$1", &[&id],
@@ -433,7 +454,9 @@ pub fn serve() -> Result<()> {
                 else {
                     return Ok((400, None));
                 };
+                review_log("webhook_received", &id, &job);
                 service.enqueue(&id, &job)?;
+                review_log("webhook_persisted", &id, &job);
                 Ok((202, Some(id)))
             })(),
             _ => Ok((404, None)),
@@ -509,7 +532,7 @@ impl Service {
         bail!("MCP execution did not complete")
     }
 
-    fn review(&self, db: &mut Client, id: &str, job: Job) -> Result<()> {
+    fn review(&self, db: &mut Client, id: &str, job: &Job) -> Result<()> {
         let post = reqwest::Method::POST;
         let patch = reqwest::Method::PATCH;
         let actor = self.get("/user")?;
@@ -559,7 +582,8 @@ impl Service {
             if !current()? {
                 return Ok(None);
             }
-            let mut review = self.model_review(id, &job, &files)?;
+            review_log("review_files_loaded", id, job);
+            let mut review = self.model_review(id, job, &files)?;
             // Check the lock connection and PR head again before an external write.
             db.simple_query("SELECT 1")?;
             if !current()? {
@@ -571,7 +595,10 @@ impl Service {
             review["body"] = json!(format!("{body}\n\n{marker}"));
             review["event"] = json!("COMMENT");
             review["commit_id"] = json!(job.head);
-            Ok(Some(self.write(post.clone(), &reviews, review)?))
+            review_log("review_publishing", id, job);
+            let published = self.write(post.clone(), &reviews, review)?;
+            review_log("review_published", id, job);
+            Ok(Some(published))
         })();
         let status = match &result {
             Ok(Some(review)) => format!(
@@ -615,6 +642,7 @@ impl Service {
         let context = json!({"repo":job.repo,"number":job.number,"head_sha":job.head,"base_sha":job.base,
             "files_available":files.len(),"files_without_patches":files.iter().filter(|f| f["patch"].is_null()).count()});
         let data = serde_json::to_string(&json!({"context":context,"files":files}))?;
+        review_log("mcp_seed_started", id, job);
         let (_, seed) = self.js(
             &session,
             format!(
@@ -623,6 +651,7 @@ impl Service {
             ),
             None,
         )?;
+        review_log("mcp_seed_finished", id, job);
         let heap = seed
             .get("heap")
             .filter(|v| !v.is_null())
@@ -671,7 +700,14 @@ impl Service {
                 job.repo, job.number, job.head
             ),
             30,
-            |messages| model::prompt(&token, &self.model, messages, &tools),
+            |messages| {
+                review_log("model_call_started", id, job);
+                let result = model::prompt(&token, &self.model, messages, &tools);
+                if result.is_ok() {
+                    review_log("model_call_finished", id, job);
+                }
+                result
+            },
             |name, args| {
                 let args: Value = serde_json::from_str(args)?;
                 match name {
