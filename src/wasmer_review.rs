@@ -157,7 +157,9 @@ impl Service {
     }
 
     fn decode_event(&self, event: &Value) -> Result<Option<Job>> {
-        if event["action"] != "labeled" || event["label"]["name"] != "wreview" {
+        if !matches!(event["action"].as_str(), Some("labeled" | "unlabeled"))
+            || event["label"]["name"] != "wreview"
+        {
             return Ok(None);
         }
         let pr = &event["pull_request"];
@@ -186,12 +188,93 @@ impl Service {
         }))
     }
 
-    fn enqueue(&self, id: &str, job: &Job) -> Result<()> {
+    fn record_delivery(
+        &self,
+        id: &str,
+        job: &Job,
+        removed: bool,
+        delivered_at: Option<&str>,
+    ) -> Result<Vec<String>> {
         ensure!(delivery_id(id), "Invalid GitHub delivery ID");
-        self.db()?.execute(
-            "INSERT INTO wreview_jobs (delivery, payload) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            &[&id, &serde_json::to_string(job)?],
+        let mut db = self.db()?;
+        let mut transaction = db.transaction()?;
+        let key = format!("wreview-label:{}/{}", job.repo, job.number);
+        transaction.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&key],
         )?;
+        let inserted = transaction.execute(
+            "INSERT INTO wreview_jobs (delivery, payload, done, received_at)
+             VALUES ($1, $2, $3, COALESCE($4::text::timestamptz, clock_timestamp()))
+             ON CONFLICT DO NOTHING",
+            &[&id, &serde_json::to_string(job)?, &removed, &delivered_at],
+        )?;
+        if inserted == 0 {
+            return Ok(Vec::new());
+        }
+        let number = job.number.to_string();
+        let changed = transaction.query(
+            "UPDATE wreview_jobs SET done=true, cancelled=true
+             WHERE NOT done AND delivery<>$1 AND payload::jsonb->>'repo'=$2
+               AND payload::jsonb->>'number'=$3
+               AND received_at < (SELECT received_at FROM wreview_jobs WHERE delivery=$1)
+             RETURNING delivery",
+            &[&id, &job.repo, &number],
+        )?;
+        transaction.execute(
+            "UPDATE wreview_jobs SET done=true, cancelled=true
+             WHERE delivery=$1 AND NOT done AND EXISTS (
+                 SELECT 1 FROM wreview_jobs newer WHERE newer.delivery<>$1
+                   AND newer.payload::jsonb->>'repo'=$2 AND newer.payload::jsonb->>'number'=$3
+                   AND newer.received_at > (SELECT received_at FROM wreview_jobs WHERE delivery=$1)
+             )",
+            &[&id, &job.repo, &number],
+        )?;
+        transaction.commit()?;
+        let cancelled: Vec<String> = changed.into_iter().map(|row| row.get(0)).collect();
+        for delivery in &cancelled {
+            review_log("review_cancelled", delivery, job);
+        }
+        Ok(cancelled)
+    }
+
+    fn mark_cancelled(&self, repo: &str, number: u64, cancelled: &[String]) -> Result<()> {
+        let actor = self.get("/user")?;
+        let root = format!("/repos/{repo}/issues");
+        for comment in self.pages(&format!("{root}/{number}/comments"))? {
+            if comment["user"]["login"] != actor["login"] {
+                continue;
+            }
+            let Some(body) = comment["body"].as_str() else {
+                continue;
+            };
+            for id in cancelled {
+                let marker = format!("<!-- wreview-status:{id} -->");
+                if body.starts_with("wreview is starting.") && body.ends_with(&marker) {
+                    let comment_id = comment["id"]
+                        .as_u64()
+                        .context("Invalid GitHub comment ID")?;
+                    self.write(
+                        reqwest::Method::PATCH,
+                        &format!("{root}/comments/{comment_id}"),
+                        json!({"body": format!("wreview cancelled.\n\n{marker}")}),
+                    )?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_active(&self, id: &str) -> Result<()> {
+        let cancelled: bool = self
+            .db()?
+            .query_one(
+                "SELECT cancelled FROM wreview_jobs WHERE delivery=$1",
+                &[&id],
+            )?
+            .get(0);
+        ensure!(!cancelled, "Review cancelled");
         Ok(())
     }
 
@@ -202,20 +285,8 @@ impl Service {
             &[&id],
         )? else { return Ok(()); };
         let job: Job = serde_json::from_str(row.get(0))?;
-        // Session-scoped lock survives transactions and releases if Wasmer kills the job.
-        let key = format!("wreview:{}/{}", job.repo, job.number);
-        let locked: bool = db
-            .query_one(
-                "SELECT pg_try_advisory_lock(hashtextextended($1,0))",
-                &[&key],
-            )?
-            .get(0);
-        if !locked {
-            review_log("review_lock_busy", id, &job);
-            return Ok(());
-        }
         let claimed = db.execute(
-            "UPDATE wreview_jobs SET attempts=attempts+1, next_attempt=now()+interval '2 minutes'
+            "UPDATE wreview_jobs SET attempts=attempts+1, next_attempt=now()+interval '10 minutes'
              WHERE delivery=$1 AND NOT done AND next_attempt<=now()",
             &[&id],
         )?;
@@ -223,7 +294,11 @@ impl Service {
             return Ok(());
         }
         review_log("review_started", id, &job);
-        match self.review(&mut db, id, &job) {
+        let result = self.review(&mut db, id, &job);
+        if self.check_active(id).is_err() {
+            return Ok(());
+        }
+        match result {
             Ok(()) => {
                 db.execute(
                     "UPDATE wreview_jobs SET done=true WHERE delivery=$1",
@@ -296,7 +371,9 @@ impl Service {
                 {
                     return Ok(());
                 }
-                if item["event"] != "pull_request" || item["action"] != "labeled" {
+                if item["event"] != "pull_request"
+                    || !matches!(item["action"].as_str(), Some("labeled" | "unlabeled"))
+                {
                     continue;
                 }
                 let guid = item["guid"]
@@ -317,7 +394,8 @@ impl Service {
                     None,
                 )?;
                 if let Some(job) = self.decode_event(&detail["request"]["payload"])? {
-                    self.enqueue(guid, &job)?;
+                    let removed = detail["request"]["payload"]["action"] == "unlabeled";
+                    self.record_delivery(guid, &job, removed, item["delivered_at"].as_str())?;
                 }
             }
             let Some(next) = next else {
@@ -387,6 +465,7 @@ impl Service {
             received_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         ALTER TABLE wreview_jobs ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ NOT NULL DEFAULT now();
+        ALTER TABLE wreview_jobs ADD COLUMN IF NOT EXISTS cancelled BOOLEAN NOT NULL DEFAULT FALSE;
         COMMIT;",
         )?;
         Ok(())
@@ -455,7 +534,21 @@ pub fn serve() -> Result<()> {
                     return Ok((400, None));
                 };
                 review_log("webhook_received", &id, &job);
-                service.enqueue(&id, &job)?;
+                let removed = event["action"] == "unlabeled";
+                let cancelled = service.record_delivery(&id, &job, removed, None)?;
+                if !cancelled.is_empty() {
+                    let service = Arc::clone(&service);
+                    let repo = job.repo.clone();
+                    let number = job.number;
+                    thread::spawn(move || {
+                        if let Err(error) = service.mark_cancelled(&repo, number, &cancelled) {
+                            eprintln!("Could not update cancelled review status: {error}");
+                        }
+                    });
+                }
+                if removed {
+                    return Ok((204, None));
+                }
                 review_log("webhook_persisted", &id, &job);
                 Ok((202, Some(id)))
             })(),
@@ -559,6 +652,7 @@ impl Service {
                     .as_array()
                     .is_some_and(|labels| labels.iter().any(|label| label["name"] == "wreview")))
         };
+        self.check_active(id)?;
         let status = match find(&comments, &status_marker)? {
             Some(value) => value,
             None => self.write(
@@ -584,8 +678,7 @@ impl Service {
             }
             review_log("review_files_loaded", id, job);
             let mut review = self.model_review(id, job, &files)?;
-            // Check the lock connection and PR head again before an external write.
-            db.simple_query("SELECT 1")?;
+            self.check_active(id)?;
             if !current()? {
                 return Ok(None);
             }
@@ -595,11 +688,13 @@ impl Service {
             review["body"] = json!(format!("{body}\n\n{marker}"));
             review["event"] = json!("COMMENT");
             review["commit_id"] = json!(job.head);
+            self.check_active(id)?;
             review_log("review_publishing", id, job);
             let published = self.write(post.clone(), &reviews, review)?;
             review_log("review_published", id, job);
             Ok(Some(published))
         })();
+        self.check_active(id)?;
         let status = match &result {
             Ok(Some(review)) => format!(
                 "wreview finished. [Read the review]({}).",
@@ -626,6 +721,13 @@ impl Service {
                 )?
                 .get(0);
             if !newer {
+                let finished = db.execute(
+                    "UPDATE wreview_jobs SET done=true WHERE delivery=$1 AND NOT cancelled",
+                    &[&id],
+                )?;
+                if finished == 0 {
+                    return Ok(());
+                }
                 self.github(
                     reqwest::Method::DELETE,
                     &format!("{root}/issues/{}/labels/wreview", job.number),
@@ -642,6 +744,7 @@ impl Service {
         let context = json!({"repo":job.repo,"number":job.number,"head_sha":job.head,"base_sha":job.base,
             "files_available":files.len(),"files_without_patches":files.iter().filter(|f| f["patch"].is_null()).count()});
         let data = serde_json::to_string(&json!({"context":context,"files":files}))?;
+        self.check_active(id)?;
         review_log("mcp_seed_started", id, job);
         let (_, seed) = self.js(
             &session,
@@ -657,6 +760,7 @@ impl Service {
             .filter(|v| !v.is_null())
             .context("MCP did not save a review snapshot")?;
         let read = |expression: &str| -> Result<Value> {
+            self.check_active(id)?;
             let (path, _) = self.js(
                 &session,
                 format!("console.log(JSON.stringify({expression}));"),
@@ -701,6 +805,7 @@ impl Service {
             ),
             30,
             |messages| {
+                self.check_active(id)?;
                 review_log("model_call_started", id, job);
                 let result = model::prompt(&token, &self.model, messages, &tools);
                 if result.is_ok() {
