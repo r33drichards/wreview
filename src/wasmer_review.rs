@@ -494,6 +494,9 @@ impl Service {
         );
         ALTER TABLE wreview_jobs ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ NOT NULL DEFAULT now();
         ALTER TABLE wreview_jobs ADD COLUMN IF NOT EXISTS cancelled BOOLEAN NOT NULL DEFAULT FALSE;
+        CREATE TABLE IF NOT EXISTS wreview_model_credential (
+            slot SMALLINT PRIMARY KEY CHECK (slot=1), generation BIGINT NOT NULL, envelope BYTEA NOT NULL
+        );
         COMMIT;",
         )?;
         Ok(())
@@ -836,6 +839,28 @@ impl Service {
         Checkout::open(&data)
     }
 
+    fn model_prompt(&self, messages: &[Value], tools: &[Value]) -> Result<Vec<Value>> {
+        let Some(key) = env::var_os("WREVIEW_OAUTH_STORAGE_KEY") else {
+            return model::prompt(&config::chatgpt_token()?, &self.model, messages, tools);
+        };
+        let key = key
+            .to_str()
+            .context("Invalid review credential encryption key")?;
+        let token = crate::review_auth::access_token(&mut self.db()?, &self.http, key, None)?;
+        let result = model::prompt(&token, &self.model, messages, tools);
+        if result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<reqwest::Error>())
+            .is_some_and(|error| error.status() == Some(reqwest::StatusCode::UNAUTHORIZED))
+        {
+            let token =
+                crate::review_auth::access_token(&mut self.db()?, &self.http, key, Some(&token))?;
+            return model::prompt(&token, &self.model, messages, tools);
+        }
+        result
+    }
+
     fn model_review(&self, id: &str, job: &Job, files: &[Value]) -> Result<Value> {
         self.check_active(id)?;
         review_log("checkout_loading", id, job);
@@ -922,7 +947,6 @@ impl Service {
                 &["body", "comments"],
             ),
         ];
-        let token = config::chatgpt_token()?;
         let anchors = anchors(files);
         let mut staged = None;
         let mut messages = vec![json!({"role":"developer","content":PROMPT})];
@@ -936,7 +960,7 @@ impl Service {
             |messages| {
                 self.check_active(id)?;
                 review_log("model_call_started", id, job);
-                let result = model::prompt(&token, &self.model, messages, &tools);
+                let result = self.model_prompt(messages, &tools);
                 if result.is_ok() {
                     review_log("model_call_finished", id, job);
                 }

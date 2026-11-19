@@ -101,3 +101,21 @@ runtime if the job is terminated. It is never uploaded to the mcp-js
 snapshot store. Archives are capped at 64 MiB compressed and 128 MiB
 expanded. The tools read UTF-8 regular files of up to 4 MiB. If the archive
 is unavailable, the review falls back to its existing patch tools.
+
+### Hosted model credential refresh
+
+Set `WREVIEW_OAUTH_STORAGE_KEY` to a base64-encoded random 32-byte key in
+Wasmer secrets. Set `WREVIEW_OAUTH_GENERATION` to a positive integer and
+`WREVIEW_OAUTH_BOOTSTRAP` to the JSON containing the dedicated worker's
+`client_id`, `access_token`, `refresh_token`, `expires_at` (Unix seconds),
+and `scope` from its Sign in with ChatGPT session. Keep all credential
+values out of logs and version control.
+
+The worker encrypts session state in Postgres, serializes refreshes, and
+saves rotated credentials before using them. It refreshes on demand
+within one minute of expiry and retries a rejected model token once.
+Once the generation is stored, the bootstrap secret can be removed.
+To replace a revoked session, sign in again and provide the new bootstrap
+with a higher generation. Keep the database encryption key stable.
+Use a separate sign-in for local CLI activity so local refreshes do not
+race the worker's refresh token rotation.
