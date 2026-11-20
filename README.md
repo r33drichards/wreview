@@ -208,14 +208,3 @@ a failed request under a new ID.
 contract. Interactive CLI history remains ephemeral. Backend credentials belong
 in secret environment variables, never source control. Database migrations are
 explicit and are not silently run on HTTP startup.
-
-## Review a GitHub pull request
-
-Add the `wreview` label to an open pull request. The webhook worker posts a
-starting comment, fetches the PR's changed files through the GitHub API,
-and prepares an isolated mcp-js snapshot. Wasmer runs the review turn.
-The worker validates changed-line anchors and checks the current head before
-publishing a comment-only review, then updates the status comment. Remove
-and reapply the label to request a new review.
-
-See [hosted review setup](review/README.md) for deployment and credentials.
